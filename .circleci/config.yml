@@ -145,4 +145,10 @@ jobs:
             # Firmware dir
             if [ "${ORGANIZE_STATUS}" = "success" ] && [ -n "${FIRMWARE:-}" ]; then
               echo "export FIRMWARE_DIR_TO_UPLOAD=${FIRMWARE}" >> "$BASH_ENV"
+
+workflows:
+  version: 2
+  build:
+    jobs:
+      - build-openwrt
        
