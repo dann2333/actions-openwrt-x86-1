@@ -1,31 +1,148 @@
-# Use the latest 2.1 version of CircleCI pipeline process engine.
-# See: https://circleci.com/docs/reference/configuration-reference
 version: 2.1
 
-# Define a job to be invoked later in a workflow.
-# See: https://circleci.com/docs/guides/orchestrate/jobs-steps/#jobs-overview & https://circleci.com/docs/reference/configuration-reference/#jobs
 jobs:
-  say-hello:
-    # Specify the execution environment. You can specify an image from Docker Hub or use one of our convenience images from CircleCI's Developer Hub.
-    # See: https://circleci.com/docs/guides/execution-managed/executor-intro/ & https://circleci.com/docs/reference/configuration-reference/#executor-job
-    docker:
-      # Specify the version you desire here
-      # See: https://circleci.com/developer/images/image/cimg/base
-      - image: cimg/base:current
-
-    # Add steps to the job
-    # See: https://circleci.com/docs/guides/orchestrate/jobs-steps/#steps-overview & https://circleci.com/docs/reference/configuration-reference/#steps
+  build-openwrt:
+    machine: 
+      image: ubuntu-2404
+    resource_class: xlarge
+    working_directory: ~/project
+    environment:
+      REPO_URL: https://github.com/coolsnowwolf/lede
+      REPO_BRANCH: master
+      FEEDS_CONF: feeds.conf.default
+      CONFIG_FILE: .config
+      DIY_P1_SH: diy-part1.sh
+      DIY_P2_SH: diy-part2.sh
+      UPLOAD_BIN_DIR: "false"
+      UPLOAD_FIRMWARE: "true"
+      UPLOAD_COWTRANSFER: "false"
+      UPLOAD_WETRANSFER: "false"
+      UPLOAD_RELEASE: "true"
+      TZ: Asia/Shanghai
     steps:
-      # Checkout the code as the first step.
       - checkout
-      - run:
-          name: "Say hello"
-          command: "echo Hello, World!"
 
-# Orchestrate jobs using workflows
-# See: https://circleci.com/docs/guides/orchestrate/workflows/ & https://circleci.com/docs/reference/configuration-reference/#workflows
-workflows:
-  say-hello-workflow: # This is the name of the workflow, feel free to change it to better match your workflow.
-    # Inside the workflow, you define the jobs you want to run.
-    jobs:
-      - say-hello
+      - run:
+          name: Initialize environment
+          command: |
+            # Optional clean-up (paths may not exist on CircleCI images)
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+
+            # System update
+            sudo -E apt update
+            sudo -E apt full-upgrade -y
+
+            # Install build dependencies (subset commonly required for OpenWrt)
+            sudo -E apt install -y \
+              ack antlr3 asciidoc autoconf automake autopoint \
+              binutils bison build-essential bzip2 ccache clang cmake cpio \
+              curl device-tree-compiler flex gawk gcc-multilib g++-multilib \
+              gettext git libncurses5-dev libssl-dev python3 python3-distutils \
+              rsync subversion swig unzip zlib1g-dev file wget time aria2 jq \
+              patch libelf-dev libtool pkg-config
+
+            # Clean apt caches
+            sudo -E apt-get -qq autoremove --purge -y
+            sudo -E apt-get -qq clean
+
+            # Timezone
+            sudo ln -sf /usr/share/zoneinfo/$TZ /etc/localtime
+            echo "$TZ" | sudo tee /etc/timezone >/dev/null || true
+
+            # Workdir
+            sudo mkdir -p /workdir
+            sudo chown "$(id -u)":"$(id -g)" /workdir
+
+            # Remember the repository workspace path for later steps
+            echo 'export WORKSPACE="$PWD"' >> "$BASH_ENV"
+
+      - run:
+          name: Clone source code
+          command: |
+            df -hT "$PWD" || true
+            git clone "$REPO_URL" -b "$REPO_BRANCH" /workdir/openwrt
+            ln -sf /workdir/openwrt "$WORKSPACE/openwrt"
+
+      - run:
+          name: Load custom feeds
+          command: |
+            if [ -e "$FEEDS_CONF" ]; then mv "$FEEDS_CONF" openwrt/feeds.conf.default; fi
+            chmod +x "$DIY_P1_SH" 2>/dev/null || true
+            cd openwrt
+            "$WORKSPACE/$DIY_P1_SH" || true
+
+      - run:
+          name: Update feeds
+          command: |
+            cd openwrt
+            ./scripts/feeds update -a
+
+      - run:
+          name: Install feeds
+          command: |
+            cd openwrt
+            ./scripts/feeds install -a
+
+      - run:
+          name: Load custom configuration
+          command: |
+            if [ -e files ]; then mv files openwrt/files; fi
+            if [ -e "$CONFIG_FILE" ]; then mv "$CONFIG_FILE" openwrt/.config; fi
+            chmod +x "$DIY_P2_SH" 2>/dev/null || true
+            cd openwrt
+            "$WORKSPACE/$DIY_P2_SH" || true
+
+      # Note: For interactive SSH, use "Rerun job with SSH" in CircleCI.
+
+      - run:
+          name: Download package sources
+          command: |
+            cd openwrt
+            make defconfig
+            make download -j8
+
+      - run:
+          name: Compile the firmware
+          command: |
+            set -eo pipefail
+            cd openwrt
+            make V=s -j"$(nproc)"
+            echo 'export COMPILE_STATUS=success' >> "$BASH_ENV"
+
+            # Derive DEVICE_NAME and timestamp for artifact naming
+            grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME || true
+            if [ -s DEVICE_NAME ]; then
+              echo "export DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$BASH_ENV"
+            fi
+            echo "export FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$BASH_ENV"
+
+      - run:
+          name: Check space usage
+          when: on_success
+          command: df -hT
+
+      - run:
+          name: Organize firmware files
+          command: |
+            if [ "${UPLOAD_FIRMWARE}" = "true" ]; then
+              cd openwrt/bin/targets/*/*
+              rm -rf packages
+              echo "export FIRMWARE=$PWD" >> "$BASH_ENV"
+              echo "export ORGANIZE_STATUS=success" >> "$BASH_ENV"
+            fi
+
+      - run:
+          name: Prepare artifact directories
+          command: |
+            mkdir -p /tmp/empty
+            # Bin dir (always ensure path exists to avoid artifact step failures)
+            mkdir -p "$WORKSPACE/openwrt/bin"
+            if [ "${COMPILE_STATUS}" = "success" ] && [ "${UPLOAD_BIN_DIR}" = "true" ]; then
+              echo "export BIN_DIR_TO_UPLOAD=$WORKSPACE/openwrt/bin" >> "$BASH_ENV"
+            else
+              echo "export BIN_DIR_TO_UPLOAD=/tmp/empty" >> "$BASH_ENV"
+            fi
+            # Firmware dir
+            if [ "${ORGANIZE_STATUS}" = "success" ] && [ -n "${FIRMWARE:-}" ]; then
+              echo "export FIRMWARE_DIR_TO_UPLOAD=${FIRMWARE}" >> "$BASH_ENV"
+       
